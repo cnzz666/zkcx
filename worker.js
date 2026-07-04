@@ -1,131 +1,111 @@
 // ================================================================
-//  Cloudflare Pages Worker — 成绩记录系统 (D1 驱动)
-//  绑定变量名: DB
-//  后台密码: admin (硬编码)
+//  成绩记录系统 — Cloudflare Pages + D1 (自动建表)
+//  绑定变量名: DB  |  后台密码: admin
+//  完全开箱即用，部署即运行
 // ================================================================
 
 export default {
   async fetch(request, env) {
+    // 首次访问自动创建表
+    await ensureTable(env);
+
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // ---------- API 路由 ----------
+    // API 路由
     if (path === '/api/records') {
       const method = request.method;
-
-      if (method === 'GET') {
-        return handleGet(env);
-      }
-
-      if (method === 'POST') {
-        return handlePost(request, env);
-      }
-
-      if (method === 'DELETE') {
-        return handleDelete(request, env);
-      }
-
-      return new Response(JSON.stringify({ error: 'Method Not Allowed' }), {
-        status: 405,
-        headers: { 'Content-Type': 'application/json' }
-      });
+      if (method === 'GET') return handleGet(env);
+      if (method === 'POST') return handlePost(request, env);
+      if (method === 'DELETE') return handleDelete(request, env);
+      return new Response(JSON.stringify({ error: 'Method Not Allowed' }), { status: 405 });
     }
 
-    // ---------- 页面路由 ----------
-    // 根路径 / 或 /admin 都返回同一个 HTML（前端控制显示）
+    // 页面路由
     if (path === '/' || path === '/admin') {
-      const html = getHtml();
-      return new Response(html, {
+      return new Response(getHtml(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       });
     }
 
-    // 其余 404
     return new Response('Not Found', { status: 404 });
   }
 };
 
-// ================================================================
-//  API 处理函数
-// ================================================================
+// ---------- 建表 ----------
+async function ensureTable(env) {
+  try {
+    await env.DB.prepare(
+      `CREATE TABLE IF NOT EXISTS records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        score TEXT NOT NULL,
+        rank TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`
+    ).run();
+  } catch (_) { /* 忽略 */ }
+}
 
-// ---------- GET 所有记录（按时间升序） ----------
+// ---------- GET ----------
 async function handleGet(env) {
   try {
     const { results } = await env.DB.prepare(
       'SELECT id, name, score, rank, created_at FROM records ORDER BY created_at ASC'
     ).all();
-    return new Response(JSON.stringify(results), {
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return Response.json(results);
   } catch (err) {
     return errorResponse(err.message);
   }
 }
 
-// ---------- POST 上传/更新记录 ----------
+// ---------- POST ----------
 async function handlePost(request, env) {
   try {
     const body = await request.json();
     const { name, score, rank, reupload } = body;
-
-    // 校验
     if (!name?.trim() || !score?.trim()) {
       return errorResponse('姓名和分数不能为空', 400);
     }
 
-    // 查询同名记录
-    const existing = await env.DB.prepare(
-      'SELECT id FROM records WHERE name = ?'
-    ).bind(name.trim()).first();
+    const existing = await env.DB.prepare('SELECT id FROM records WHERE name = ?')
+      .bind(name.trim()).first();
 
-    // 如果已存在且未勾选重新上传 => 拒绝
     if (existing && !reupload) {
       return errorResponse(`姓名 "${name.trim()}" 已存在，请勾选"重新上传"以修改`, 409);
     }
-
-    // 如果存在且勾选了重新上传 => 删除旧记录
     if (existing && reupload) {
-      await env.DB.prepare('DELETE FROM records WHERE name = ?').bind(name.trim()).run();
+      await env.DB.prepare('DELETE FROM records WHERE name = ?')
+        .bind(name.trim()).run();
     }
 
-    // 插入新记录
-    await env.DB.prepare(
-      'INSERT INTO records (name, score, rank) VALUES (?, ?, ?)'
-    ).bind(name.trim(), score.trim(), rank?.trim() || null).run();
+    await env.DB.prepare('INSERT INTO records (name, score, rank) VALUES (?, ?, ?)')
+      .bind(name.trim(), score.trim(), rank?.trim() || null).run();
 
-    return new Response(JSON.stringify({ message: '上传成功' }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
+    return Response.json({ message: '上传成功' });
   } catch (err) {
     return errorResponse(err.message);
   }
 }
 
-// ---------- DELETE 删除记录（需要密码验证） ----------
+// ---------- DELETE ----------
 async function handleDelete(request, env) {
   try {
     const url = new URL(request.url);
     const id = url.searchParams.get('id');
     const password = url.searchParams.get('password');
-
     if (!id) return errorResponse('缺少记录 ID', 400);
     if (password !== 'admin') return errorResponse('密码错误', 403);
 
-    const result = await env.DB.prepare('DELETE FROM records WHERE id = ?').bind(id).run();
-    if (result.meta.changes === 0) {
-      return errorResponse('记录不存在', 404);
-    }
-
-    return new Response(JSON.stringify({ message: '删除成功' }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
+    const result = await env.DB.prepare('DELETE FROM records WHERE id = ?')
+      .bind(id).run();
+    if (result.meta.changes === 0) return errorResponse('记录不存在', 404);
+    return Response.json({ message: '删除成功' });
   } catch (err) {
     return errorResponse(err.message);
   }
 }
 
-// ---------- 错误响应 ----------
 function errorResponse(message, status = 500) {
   return new Response(JSON.stringify({ error: message }), {
     status,
@@ -133,10 +113,7 @@ function errorResponse(message, status = 500) {
   });
 }
 
-// ================================================================
-//  前端 HTML（嵌入所有 CSS + JS）
-// ================================================================
-
+// ---------- HTML 页面（全部内嵌） ----------
 function getHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -146,29 +123,14 @@ function getHtml() {
   <title>成绩记录系统</title>
   <style>
     * { margin:0; padding:0; box-sizing:border-box; }
-    body {
-      font-family: -apple-system, system-ui, sans-serif;
-      background: #f5f7fb;
-      padding: 20px;
-      color: #1e293b;
-    }
+    body { font-family: -apple-system, system-ui, sans-serif; background: #f5f7fb; padding: 20px; color: #1e293b; }
     .container { max-width: 1100px; margin:0 auto; }
-    .header {
-      display: flex; justify-content: space-between; align-items: center;
-      flex-wrap: wrap; gap: 12px;
-      background: #fff; padding: 16px 24px; border-radius: 16px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.06); margin-bottom: 24px;
-    }
+    .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; background: #fff; padding: 16px 24px; border-radius: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); margin-bottom: 24px; }
     .header h1 { font-size: 22px; font-weight: 700; }
     .header h1 span { color: #3b82f6; }
     .stats { background: #f1f5f9; padding: 4px 16px; border-radius: 30px; font-size: 14px; }
     .stats strong { color: #0f172a; }
-    .btn {
-      display: inline-flex; align-items: center; gap: 6px;
-      padding: 8px 20px; border: none; border-radius: 30px;
-      font-size: 14px; font-weight: 600; cursor: pointer;
-      transition: 0.2s;
-    }
+    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 20px; border: none; border-radius: 30px; font-size: 14px; font-weight: 600; cursor: pointer; transition: 0.2s; }
     .btn-primary { background: #3b82f6; color: #fff; }
     .btn-primary:hover { background: #2563eb; transform: translateY(-1px); }
     .btn-danger { background: #ef4444; color: #fff; }
@@ -176,30 +138,18 @@ function getHtml() {
     .btn-outline { background: transparent; color: #3b82f6; border: 1.5px solid #3b82f6; }
     .btn-outline:hover { background: #eff6ff; }
     .btn-sm { padding: 4px 14px; font-size: 12px; }
-    .card {
-      background: #fff; border-radius: 16px; padding: 20px 24px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.06); margin-bottom: 24px;
-    }
+    .card { background: #fff; border-radius: 16px; padding: 20px 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); margin-bottom: 24px; }
     .card-title { font-size: 17px; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
     .badge { background: #e2e8f0; color: #475569; font-size: 12px; padding: 1px 12px; border-radius: 30px; }
-    .form-row {
-      display: flex; flex-wrap: wrap; gap: 16px 20px; align-items: flex-end;
-    }
+    .form-row { display: flex; flex-wrap: wrap; gap: 16px 20px; align-items: flex-end; }
     .form-group { flex: 1 1 160px; min-width: 130px; }
     .form-group label { display: block; font-size: 13px; font-weight: 500; color: #475569; margin-bottom: 4px; }
-    .form-group input {
-      width: 100%; padding: 10px 14px; border: 1.5px solid #e2e8f0; border-radius: 10px;
-      font-size: 14px; background: #fafbfc; transition: 0.2s;
-    }
+    .form-group input { width: 100%; padding: 10px 14px; border: 1.5px solid #e2e8f0; border-radius: 10px; font-size: 14px; background: #fafbfc; transition: 0.2s; }
     .form-group input:focus { outline: none; border-color: #3b82f6; background: #fff; box-shadow: 0 0 0 3px rgba(59,130,246,0.12); }
     .form-check { display: flex; align-items: center; gap: 8px; padding-top: 6px; flex: 0 0 auto; }
     .form-check input[type="checkbox"] { width: 18px; height: 18px; accent-color: #3b82f6; cursor: pointer; }
     .form-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 0 0 auto; }
-    .toast {
-      padding: 12px 18px; border-radius: 12px; font-size: 14px; font-weight: 500;
-      margin-bottom: 16px; display: none; align-items: center; gap: 10px;
-      border-left: 4px solid;
-    }
+    .toast { padding: 12px 18px; border-radius: 12px; font-size: 14px; font-weight: 500; margin-bottom: 16px; display: none; align-items: center; gap: 10px; border-left: 4px solid; }
     .toast.show { display: flex; }
     .toast-success { background: #f0fdf4; border-color: #22c55e; color: #166534; }
     .toast-error { background: #fef2f2; border-color: #ef4444; color: #991b1b; }
@@ -215,7 +165,6 @@ function getHtml() {
     .time-text { font-size: 13px; color: #64748b; white-space: nowrap; }
     .empty-state { text-align: center; padding: 40px 20px; color: #94a3b8; }
     .empty-state .icon { font-size: 40px; margin-bottom: 12px; }
-    .admin-toggle { margin-top: 8px; }
     .hidden { display: none !important; }
     @media (max-width: 768px) {
       .header { flex-direction: column; align-items: stretch; }
@@ -228,7 +177,6 @@ function getHtml() {
 </head>
 <body>
 <div class="container" id="app">
-  <!-- 头部 -->
   <header class="header">
     <h1>📊 成绩<span>记录</span></h1>
     <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
@@ -236,11 +184,7 @@ function getHtml() {
       <button class="btn btn-outline btn-sm" id="adminBtn">🔐 管理后台</button>
     </div>
   </header>
-
-  <!-- 提示 -->
   <div id="toast" class="toast"></div>
-
-  <!-- 上传卡片 -->
   <div class="card">
     <div class="card-title">✏️ 上传成绩 <span class="badge">请勿重复上传</span></div>
     <form id="uploadForm" autocomplete="off">
@@ -268,8 +212,6 @@ function getHtml() {
       </div>
     </form>
   </div>
-
-  <!-- 列表卡片 -->
   <div class="card">
     <div class="card-title">
       📋 成绩列表
@@ -296,17 +238,10 @@ function getHtml() {
     </div>
   </div>
 </div>
-
 <script>
-  // ============================================================
-  // 前端交互逻辑
-  // ============================================================
   const API_BASE = '/api/records';
   const ADMIN_PASSWORD = 'admin';
-
   const $ = s => document.querySelector(s);
-  const $$ = s => document.querySelectorAll(s);
-
   const nameInput = $('#nameInput');
   const scoreInput = $('#scoreInput');
   const rankInput = $('#rankInput');
@@ -320,10 +255,8 @@ function getHtml() {
   const toast = $('#toast');
   const adminBtn = $('#adminBtn');
   const actionHeader = $('#actionHeader');
+  let isAdmin = false;
 
-  let isAdmin = false;  // 是否已登录管理员
-
-  // ---------- Toast ----------
   function showToast(msg, type='info') {
     toast.className = 'toast show toast-' + type;
     toast.textContent = msg;
@@ -331,7 +264,6 @@ function getHtml() {
     toast._timer = setTimeout(() => toast.classList.remove('show'), 5000);
   }
 
-  // ---------- 加载数据 ----------
   async function loadRecords() {
     try {
       const res = await fetch(API_BASE);
@@ -353,16 +285,11 @@ function getHtml() {
     }
     emptyState.style.display = 'none';
     recordCount.textContent = records.length + ' 条';
-
-    // 按时间升序
     const sorted = [...records].sort((a,b) => new Date(a.created_at) - new Date(b.created_at));
-
     recordsBody.innerHTML = sorted.map((r, idx) => {
       const time = formatTime(r.created_at);
       const rankHtml = r.rank ? `<span class="rank-badge">${escHtml(r.rank)}</span>` : '<span class="text-muted">—</span>';
-      const delBtn = isAdmin
-        ? `<button class="btn btn-danger btn-sm" onclick="deleteRecord(${r.id})">删除</button>`
-        : '';
+      const delBtn = isAdmin ? `<button class="btn btn-danger btn-sm" onclick="deleteRecord(${r.id})">删除</button>` : '';
       return `
         <tr>
           <td>${idx + 1}</td>
@@ -374,8 +301,6 @@ function getHtml() {
         </tr>
       `;
     }).join('');
-
-    // 显示/隐藏操作列
     actionHeader.classList.toggle('hidden', !isAdmin);
   }
 
@@ -388,7 +313,7 @@ function getHtml() {
     try {
       const d = new Date(iso);
       const pad = n => String(n).padStart(2,'0');
-      return \`\${d.getFullYear()}-\${pad(d.getMonth()+1)}-\${pad(d.getDate())} \${pad(d.getHours())}:\${pad(d.getMinutes())}\`;
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
     } catch { return iso; }
   }
 
@@ -398,17 +323,11 @@ function getHtml() {
     return String(text).replace(/[&<>"']/g, m => map[m]);
   }
 
-  // ---------- 删除（需密码） ----------
   window.deleteRecord = async function(id) {
-    if (!isAdmin) {
-      showToast('请先登录管理后台', 'warning');
-      return;
-    }
+    if (!isAdmin) { showToast('请先登录管理后台', 'warning'); return; }
     if (!confirm('确定删除该记录吗？')) return;
     try {
-      const res = await fetch(\`\${API_BASE}?id=\${id}&password=\${ADMIN_PASSWORD}\`, {
-        method: 'DELETE'
-      });
+      const res = await fetch(`${API_BASE}?id=${id}&password=${ADMIN_PASSWORD}`, { method: 'DELETE' });
       const result = await res.json();
       if (!res.ok) throw new Error(result.error || '删除失败');
       showToast('✅ 删除成功', 'success');
@@ -418,14 +337,12 @@ function getHtml() {
     }
   };
 
-  // ---------- 管理员登录 ----------
   adminBtn.addEventListener('click', function() {
     if (isAdmin) {
-      // 退出登录
       isAdmin = false;
       adminBtn.textContent = '🔐 管理后台';
       showToast('已退出管理模式', 'info');
-      loadRecords();  // 刷新隐藏删除按钮
+      loadRecords();
       return;
     }
     const pwd = prompt('请输入管理员密码：');
@@ -433,35 +350,27 @@ function getHtml() {
       isAdmin = true;
       adminBtn.textContent = '🚪 退出管理';
       showToast('✅ 管理员模式已开启', 'success');
-      loadRecords();  // 刷新显示删除按钮
+      loadRecords();
     } else if (pwd !== null) {
       showToast('❌ 密码错误', 'error');
     }
   });
 
-  // ---------- 提交表单 ----------
   uploadForm.addEventListener('submit', async function(e) {
     e.preventDefault();
     const name = nameInput.value.trim();
     const score = scoreInput.value.trim();
     const rank = rankInput.value.trim() || null;
     const reupload = reuploadCheck.checked;
-
-    if (!name || !score) {
-      showToast('⚠️ 请填写姓名和分数', 'warning');
-      return;
-    }
-
+    if (!name || !score) { showToast('⚠️ 请填写姓名和分数', 'warning'); return; }
     submitBtn.disabled = true;
     submitBtn.innerHTML = '<span style="display:inline-block;width:18px;height:18px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin 0.6s linear infinite;"></span> 提交中...';
-    // 简单spin样式（动态添加）
     if (!document.getElementById('spinStyle')) {
       const style = document.createElement('style');
       style.id = 'spinStyle';
       style.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
       document.head.appendChild(style);
     }
-
     try {
       const payload = { name, score, rank, reupload };
       const res = await fetch(API_BASE, {
@@ -472,11 +381,9 @@ function getHtml() {
       const result = await res.json();
       if (!res.ok) throw new Error(result.error || '上传失败');
       showToast('✅ ' + (result.message || '上传成功！'), 'success');
-      // 清空表单（保留重新上传状态）
       nameInput.value = '';
       scoreInput.value = '';
       rankInput.value = '';
-      // 不自动取消重新上传
       loadRecords();
     } catch (err) {
       showToast('❌ ' + err.message, 'error');
@@ -486,7 +393,6 @@ function getHtml() {
     }
   });
 
-  // ---------- 初始化 ----------
   loadRecords();
 </script>
 </body>
