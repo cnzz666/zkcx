@@ -45,7 +45,26 @@ async function handleGet(env) {
 async function handlePost(request, env) {
   try {
     const body = await request.json();
-    const { name, score, rank, reupload } = body;
+    const { name, score, rank, reupload, turnstileToken } = body;
+
+    // ---------- Turnstile 验证 ----------
+    if (!turnstileToken) {
+      return errorResponse('请完成人机验证', 400);
+    }
+    const verifyRes = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        secret: '0x4AAAAAADvgcs5xvnA72ewTrF9WIDx7C3w',
+        response: turnstileToken
+      })
+    });
+    const verifyData = await verifyRes.json();
+    if (!verifyData.success) {
+      return errorResponse('人机验证失败，请重试', 403);
+    }
+
+    // ---------- 业务逻辑 ----------
     if (!name?.trim() || !score?.trim()) {
       return errorResponse('姓名和分数不能为空', 400);
     }
@@ -97,6 +116,8 @@ function getHtml() {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>成绩记录系统</title>
+  <!-- Turnstile 脚本 -->
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
   <style>
     * { margin:0; padding:0; box-sizing:border-box; }
     body { font-family: -apple-system, system-ui, sans-serif; background: #f5f7fb; padding: 20px; color: #1e293b; }
@@ -125,6 +146,7 @@ function getHtml() {
     .form-check { display: flex; align-items: center; gap: 8px; padding-top: 6px; flex: 0 0 auto; }
     .form-check input[type="checkbox"] { width: 18px; height: 18px; accent-color: #3b82f6; cursor: pointer; }
     .form-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 0 0 auto; }
+    .cf-turnstile { margin: 4px 0 8px 0; }
     .toast { padding: 12px 18px; border-radius: 12px; font-size: 14px; font-weight: 500; margin-bottom: 16px; display: none; align-items: center; gap: 10px; border-left: 4px solid; }
     .toast.show { display: flex; }
     .toast-success { background: #f0fdf4; border-color: #22c55e; color: #166534; }
@@ -162,7 +184,7 @@ function getHtml() {
   </header>
   <div id="toast" class="toast"></div>
   <div class="card">
-    <div class="card-title">✏️ 上传成绩 <span class="badge">请勿重复上传</span></div>
+    <div class="card-title">✏️ 上传成绩  <span class="badge">请勿重复上传，本站使用世界协调时进行记录。</span></div>
     <form id="uploadForm" autocomplete="off">
       <div class="form-row">
         <div class="form-group">
@@ -175,12 +197,14 @@ function getHtml() {
         </div>
         <div class="form-group">
           <label for="rankInput">排名（选填）</label>
-          <input type="text" id="rankInput" placeholder="例如：第3名" />
+          <input type="text" id="rankInput" placeholder="例如：3" />
         </div>
         <div class="form-check">
           <input type="checkbox" id="reuploadCheck" />
           <label for="reuploadCheck">🔄 重新上传</label>
         </div>
+        <!-- Turnstile 容器 -->
+        <div class="cf-turnstile" data-sitekey="0x4AAAAAADvgciKnEwOxcyuj" data-callback="onTurnstileSuccess"></div>
         <div class="form-actions">
           <button type="submit" class="btn btn-primary" id="submitBtn">📤 提交</button>
           <button type="reset" class="btn btn-outline">清空</button>
@@ -232,6 +256,12 @@ function getHtml() {
   const adminBtn = $('#adminBtn');
   const actionHeader = $('#actionHeader');
   let isAdmin = false;
+  let turnstileToken = null;
+
+  // Turnstile 回调
+  window.onTurnstileSuccess = function(token) {
+    turnstileToken = token;
+  };
 
   function showToast(msg, type) {
     type = type || 'info';
@@ -336,11 +366,19 @@ function getHtml() {
 
   uploadForm.addEventListener('submit', async function(e) {
     e.preventDefault();
+
+    // 检查 Turnstile 是否通过
+    if (!turnstileToken) {
+      showToast('⚠️ 请先完成人机验证', 'warning');
+      return;
+    }
+
     const name = nameInput.value.trim();
     const score = scoreInput.value.trim();
     const rank = rankInput.value.trim() || null;
     const reupload = reuploadCheck.checked;
     if (!name || !score) { showToast('⚠️ 请填写姓名和分数', 'warning'); return; }
+
     submitBtn.disabled = true;
     submitBtn.innerHTML = '<span style="display:inline-block;width:18px;height:18px;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin 0.6s linear infinite;"></span> 提交中...';
     if (!document.getElementById('spinStyle')) {
@@ -349,8 +387,9 @@ function getHtml() {
       style.textContent = '@keyframes spin { to { transform: rotate(360deg); } }';
       document.head.appendChild(style);
     }
+
     try {
-      const payload = { name, score, rank, reupload };
+      const payload = { name, score, rank, reupload, turnstileToken };
       const res = await fetch(API_BASE, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -359,18 +398,29 @@ function getHtml() {
       const result = await res.json();
       if (!res.ok) throw new Error(result.error || '上传失败');
       showToast('✅ ' + (result.message || '上传成功！'), 'success');
+      // 重置 Turnstile（让用户重新验证）
+      turnstile.reset();
+      turnstileToken = null;
       nameInput.value = '';
       scoreInput.value = '';
       rankInput.value = '';
       loadRecords();
     } catch (err) {
       showToast('❌ ' + err.message, 'error');
+      // 验证失败也重置 Turnstile，让用户重试
+      turnstile.reset();
+      turnstileToken = null;
     } finally {
       submitBtn.disabled = false;
       submitBtn.innerHTML = '📤 提交';
     }
   });
 
+  // 加载时初始化 Turnstile 会自行渲染，但需重置函数
+  // 为了重置，使用 turnstile.reset()，需确保 turnstile 对象存在
+  // 在提交后重置
+  // 另外，页面加载后，如果 Turnstile 未自动渲染，可以手动调用
+  // 但因为有 data-sitekey，会自动渲染
   loadRecords();
 </script>
 </body>
